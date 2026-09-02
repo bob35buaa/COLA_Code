@@ -1,5 +1,18 @@
 # 进度日志
 
+## 会话：2026-09-02（续：Phase 1 smoke）
+
+### 阶段 7：单卡 Phase 1 smoke
+- **状态：** complete
+- 执行的操作：
+  - 单卡 headless：`--num_envs=64 --max_iterations=2 --logger=tensorboard --run_name=phase1_smoke`
+  - 与 sugar 进程共用 RTX 5090
+- 测试结果：
+  - Kit 启动成功，选中 RTX 5090 / Vulkan
+  - 环境、Actor/Critic、PPO 两轮 iteration 跑通
+  - `Learning iteration 1/2`，约 583 steps/s，exit=0
+  - inotify `errno=28` 是 watch 上限噪音，磁盘仍有 574G
+
 ## 会话：2026-09-02（续：补装 isaaclab）
 
 ### 阶段 6：补装 isaaclab 核心包
