@@ -35,6 +35,10 @@ pip install -U torch==2.7.0 torchvision==0.22.0 \
 pip install "isaacsim[all,extscache]==5.1.0" \
   --extra-index-url https://pypi.nvidia.com
 
+## 需要把 IsaacLab/source/isaaclab/setup.py 里的 flatdict==4.0.1 改成 4.1.0（只动子模块这一处 pin）
+## 安装 flatdict==4.1.0，再 pip install -e IsaacLab/source/isaaclab
+
+pip install flatdict==4.1.0
 ./IsaacLab/isaaclab.sh --install
 pip install -r requirements.txt
 pip install -e rsl_rl
