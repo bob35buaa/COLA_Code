@@ -33,3 +33,7 @@ slurm-*.err
 *.aac
 *.m4a
 *.m4v
+
+new_backbone_logs/
+logs/
+log/
