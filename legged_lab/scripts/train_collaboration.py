@@ -1,6 +1,25 @@
 """Train a phase-2 teacher or phase-3 student on static scene populations."""
 
 import argparse
+import os
+
+# Isolate Isaac Sim kit state per torchrun rank before AppLauncher starts.
+_rank_for_runtime = os.environ.get("RANK")
+if _rank_for_runtime is not None:
+    _runtime_root = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            ".isaacsim_runtime",
+            f"rank_{_rank_for_runtime}",
+        )
+    )
+    os.makedirs(_runtime_root, exist_ok=True)
+    os.environ["OMNI_USER_DIR"] = os.path.join(_runtime_root, "omni_user")
+    os.environ["XDG_CACHE_HOME"] = os.path.join(_runtime_root, "xdg_cache")
+    os.makedirs(os.environ["OMNI_USER_DIR"], exist_ok=True)
+    os.makedirs(os.environ["XDG_CACHE_HOME"], exist_ok=True)
 
 from isaaclab.app import AppLauncher
 import legged_lab.utils.cli_args as cli_args  # isort: skip
@@ -49,8 +68,51 @@ from isaaclab_tasks.utils import get_checkpoint_path
 
 import os
 import re
+import shutil
+import time
 
 import torch
+
+
+def _env_sync_dir(sync_id: str) -> str:
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(repo_root, ".isaacsim_runtime", "env_sync", sync_id)
+
+
+def _reset_env_sync(sync_id: str, global_rank: int) -> None:
+    if global_rank != 0:
+        return
+    sync_dir = _env_sync_dir(sync_id)
+    if os.path.isdir(sync_dir):
+        shutil.rmtree(sync_dir)
+    os.makedirs(sync_dir, exist_ok=True)
+
+
+def _wait_for_env_turn(sync_id: str, global_rank: int) -> None:
+    if global_rank == 0:
+        return
+    sync_dir = _env_sync_dir(sync_id)
+    os.makedirs(sync_dir, exist_ok=True)
+    predecessor = os.path.join(sync_dir, f"rank_{global_rank - 1}.done")
+    while not os.path.exists(predecessor):
+        time.sleep(2)
+
+
+def _mark_env_turn_done(sync_id: str, global_rank: int) -> None:
+    sync_dir = _env_sync_dir(sync_id)
+    os.makedirs(sync_dir, exist_ok=True)
+    with open(os.path.join(sync_dir, f"rank_{global_rank}.done"), "w", encoding="utf-8") as handle:
+        handle.write("done\n")
+
+
+def _disable_debug_vis_for_distributed(*cfgs) -> None:
+    """Command debug markers are expensive with thousands of cloned envs."""
+
+    for cfg in cfgs:
+        if hasattr(cfg, "commands"):
+            cfg.commands.debug_vis = False
+        if hasattr(cfg, "pose_commands"):
+            cfg.pose_commands.debug_vis = False
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -176,6 +238,14 @@ def train():
         right_fixed_rank_count=args_cli.right_fixed_rank_count,
     )
 
+    # Avoid four Isaac Sim ranks contending on one kit log directory.
+    isaaclab_log_root = os.environ.get(
+        "COLA_ISAACLAB_LOG_DIR", os.path.abspath("logs/isaaclab")
+    )
+    os.environ["COLA_ISAACLAB_LOG_DIR"] = os.path.join(
+        isaaclab_log_root, f"rank_{global_rank}"
+    )
+
     tasks = TASKS[args_cli.phase]
     fixed_bar_env_cfg, agent_cfg = task_registry.get_cfgs(tasks["left"])
     right_fixed_env_cfg, _ = task_registry.get_cfgs(tasks["right"])
@@ -198,6 +268,12 @@ def train():
         no_object_env_cfg.scene.num_envs = args_cli.num_envs
         right_fixed_env_cfg.scene.num_envs = args_cli.num_envs
 
+    _disable_debug_vis_for_distributed(
+        fixed_bar_env_cfg,
+        right_fixed_env_cfg,
+        no_object_env_cfg,
+    )
+
     agent_cfg = update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.device = f"cuda:{app_launcher.local_rank}"
     env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
@@ -206,6 +282,9 @@ def train():
     env_cfg.scene.seed = rank_seed
     agent_cfg.seed = rank_seed
 
+    sync_id = os.environ.get("COLA_STATIC_MIX_RUN_ID") or agent_cfg.run_name or "default"
+    _reset_env_sync(sync_id, global_rank)
+
     print(
         "[STATIC-MIX] "
         f"rank={global_rank}/{world_size} local_rank={app_launcher.local_rank} "
@@ -213,9 +292,14 @@ def train():
         f"num_envs={env_cfg.scene.num_envs} seed={rank_seed}",
         flush=True,
     )
+    _wait_for_env_turn(sync_id, global_rank)
+    if global_rank == 0:
+        print(f"[STATIC-MIX] env turn start rank={global_rank}", flush=True)
     env = env_class(env_cfg, args_cli.headless)
     env.cola_topology_id = assignment.topology_id
     env.cola_topology_name = assignment.topology_name
+    _mark_env_turn_done(sync_id, global_rank)
+    print(f"[STATIC-MIX] env ready rank={global_rank}/{world_size}", flush=True)
 
     log_root_path = os.path.abspath(
         os.path.join("logs", agent_cfg.experiment_name)
@@ -270,6 +354,9 @@ def train():
             right_fixed_env_cfg,
         )
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+
+    if args_cli.distributed:
+        torch.distributed.barrier()
 
     runner.learn(
         num_learning_iterations=agent_cfg.max_iterations,

@@ -17,4 +17,7 @@ export COLA_ISAACLAB_LOG_DIR="${COLA_ISAACLAB_LOG_DIR:-${COLA_ROOT}/logs/isaacla
 
 export OMNI_KIT_ACCEPT_EULA=YES
 export WANDB_MODE=${WANDB_MODE:-offline}
+if [ -n "${CONDA_PREFIX:-}" ] && [ -d "${CONDA_PREFIX}/lib" ]; then
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
 echo "[setup] COLA_ROOT=${COLA_ROOT}"

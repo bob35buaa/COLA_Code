@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.isaacsim_runtime/
 logs/
 wandb/
 outputs/
