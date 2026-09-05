@@ -57,6 +57,8 @@ simulation_app = app_launcher.app
 from legged_lab.utils.task_registry import task_registry
 from legged_lab.utils.app import run_with_simulation_app
 from legged_lab.utils.static_population import (
+    FIXED_BAR_TOPOLOGY_ID,
+    StaticPopulationAssignment,
     assign_three_static_populations,
 )
 from rsl_rl.runners import OnPolicyRunnerWholePipeResi
@@ -70,6 +72,7 @@ import os
 import re
 import shutil
 import time
+from datetime import datetime
 
 import torch
 
@@ -223,28 +226,32 @@ def _validate_synchronized_policy(runner: OnPolicyRunnerWholePipeResi) -> None:
 
 
 def train():
-    if not args_cli.distributed:
-        raise ValueError(
-            "static mixed-topology training requires --distributed; use the "
-            "individual registered task for a one-GPU smoke test"
+    distributed = bool(args_cli.distributed)
+    if distributed:
+        world_size = int(os.environ["WORLD_SIZE"])
+        global_rank = int(os.environ["RANK"])
+        assignment = assign_three_static_populations(
+            global_rank,
+            world_size,
+            no_object_rank_count=args_cli.no_object_rank_count,
+            right_fixed_rank_count=args_cli.right_fixed_rank_count,
         )
-
-    world_size = int(os.environ["WORLD_SIZE"])
-    global_rank = int(os.environ["RANK"])
-    assignment = assign_three_static_populations(
-        global_rank,
-        world_size,
-        no_object_rank_count=args_cli.no_object_rank_count,
-        right_fixed_rank_count=args_cli.right_fixed_rank_count,
-    )
-
-    # Avoid four Isaac Sim ranks contending on one kit log directory.
-    isaaclab_log_root = os.environ.get(
-        "COLA_ISAACLAB_LOG_DIR", os.path.abspath("logs/isaaclab")
-    )
-    os.environ["COLA_ISAACLAB_LOG_DIR"] = os.path.join(
-        isaaclab_log_root, f"rank_{global_rank}"
-    )
+        # Avoid ranks contending on one kit log directory.
+        isaaclab_log_root = os.environ.get(
+            "COLA_ISAACLAB_LOG_DIR", os.path.abspath("logs/isaaclab")
+        )
+        os.environ["COLA_ISAACLAB_LOG_DIR"] = os.path.join(
+            isaaclab_log_root, f"rank_{global_rank}"
+        )
+    else:
+        # Single-GPU smoke / one-topology run: left-fixed-bar only.
+        world_size = 1
+        global_rank = 0
+        assignment = StaticPopulationAssignment(
+            topology_id=FIXED_BAR_TOPOLOGY_ID,
+            topology_name="left_fixed_bar",
+            is_no_object=False,
+        )
 
     tasks = TASKS[args_cli.phase]
     fixed_bar_env_cfg, agent_cfg = task_registry.get_cfgs(tasks["left"])
@@ -275,43 +282,56 @@ def train():
     )
 
     agent_cfg = update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.device = f"cuda:{app_launcher.local_rank}"
-    env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
-    agent_cfg.device = f"cuda:{app_launcher.local_rank}"
-    rank_seed = agent_cfg.seed + global_rank
+    if distributed:
+        env_cfg.device = f"cuda:{app_launcher.local_rank}"
+        env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
+        agent_cfg.device = f"cuda:{app_launcher.local_rank}"
+        rank_seed = agent_cfg.seed + global_rank
+    else:
+        rank_seed = agent_cfg.seed
     env_cfg.scene.seed = rank_seed
     agent_cfg.seed = rank_seed
 
-    sync_id = os.environ.get("COLA_STATIC_MIX_RUN_ID") or agent_cfg.run_name or "default"
-    _reset_env_sync(sync_id, global_rank)
+    sync_id = None
+    if distributed:
+        sync_id = os.environ.get("COLA_STATIC_MIX_RUN_ID") or agent_cfg.run_name or "default"
+        _reset_env_sync(sync_id, global_rank)
 
     print(
         "[STATIC-MIX] "
-        f"rank={global_rank}/{world_size} local_rank={app_launcher.local_rank} "
+        f"rank={global_rank}/{world_size} local_rank={getattr(app_launcher, 'local_rank', 0)} "
         f"topology={assignment.topology_name} task={selected_task} "
         f"num_envs={env_cfg.scene.num_envs} seed={rank_seed}",
         flush=True,
     )
-    _wait_for_env_turn(sync_id, global_rank)
-    if global_rank == 0:
-        print(f"[STATIC-MIX] env turn start rank={global_rank}", flush=True)
+    if distributed:
+        _wait_for_env_turn(sync_id, global_rank)
+        if global_rank == 0:
+            print(f"[STATIC-MIX] env turn start rank={global_rank}", flush=True)
     env = env_class(env_cfg, args_cli.headless)
     env.cola_topology_id = assignment.topology_id
     env.cola_topology_name = assignment.topology_name
-    _mark_env_turn_done(sync_id, global_rank)
-    print(f"[STATIC-MIX] env ready rank={global_rank}/{world_size}", flush=True)
+    if distributed:
+        _mark_env_turn_done(sync_id, global_rank)
+        print(f"[STATIC-MIX] env ready rank={global_rank}/{world_size}", flush=True)
 
     log_root_path = os.path.abspath(
         os.path.join("logs", agent_cfg.experiment_name)
     )
-    shared_run_id = os.environ.get("COLA_STATIC_MIX_RUN_ID") or agent_cfg.run_name
-    if not shared_run_id:
-        raise ValueError(
-            "distributed static-mix training requires --run_name or "
-            "COLA_STATIC_MIX_RUN_ID so every rank uses one log directory"
-        )
-    log_name = "static_mix_" + _safe_run_component(shared_run_id)
-    log_dir = os.path.join(log_root_path, log_name)
+    if distributed:
+        shared_run_id = os.environ.get("COLA_STATIC_MIX_RUN_ID") or agent_cfg.run_name
+        if not shared_run_id:
+            raise ValueError(
+                "distributed static-mix training requires --run_name or "
+                "COLA_STATIC_MIX_RUN_ID so every rank uses one log directory"
+            )
+        log_name = "static_mix_" + _safe_run_component(shared_run_id)
+        log_dir = os.path.join(log_root_path, log_name)
+    else:
+        log_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if agent_cfg.run_name:
+            log_name += f"_{agent_cfg.run_name}"
+        log_dir = os.path.join(log_root_path, log_name)
 
     runner = OnPolicyRunnerWholePipeResi(
         env,
@@ -319,11 +339,12 @@ def train():
         log_dir=log_dir,
         device=agent_cfg.device,
     )
-    _validate_runtime_contract(
-        runner,
-        args_cli.no_object_rank_count,
-        args_cli.right_fixed_rank_count,
-    )
+    if distributed:
+        _validate_runtime_contract(
+            runner,
+            args_cli.no_object_rank_count,
+            args_cli.right_fixed_rank_count,
+        )
 
     if agent_cfg.resume:
         if "/" in agent_cfg.load_run:
@@ -348,21 +369,23 @@ def train():
     if global_rank == 0:
         os.makedirs(os.path.join(log_dir, "params"), exist_ok=True)
         dump_yaml(os.path.join(log_dir, "params", "env_fixed_bar.yaml"), fixed_bar_env_cfg)
-        dump_yaml(os.path.join(log_dir, "params", "env_no_object.yaml"), no_object_env_cfg)
-        dump_yaml(
-            os.path.join(log_dir, "params", "env_right_fixed.yaml"),
-            right_fixed_env_cfg,
-        )
+        if distributed:
+            dump_yaml(os.path.join(log_dir, "params", "env_no_object.yaml"), no_object_env_cfg)
+            dump_yaml(
+                os.path.join(log_dir, "params", "env_right_fixed.yaml"),
+                right_fixed_env_cfg,
+            )
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
-    if args_cli.distributed:
+    if distributed:
         torch.distributed.barrier()
 
     runner.learn(
         num_learning_iterations=agent_cfg.max_iterations,
         init_at_random_ep_len=True,
     )
-    _validate_synchronized_policy(runner)
+    if distributed:
+        _validate_synchronized_policy(runner)
 
 
 if __name__ == "__main__":
